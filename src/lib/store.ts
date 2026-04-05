@@ -1,33 +1,5 @@
-import { Redis } from "@upstash/redis";
+import { createClient } from "redis";
 import { Article, PipelineRun } from "./types";
-
-// Vercel's Redis marketplace sets STORAGE_REDIS_URL as a full redis:// URL.
-// Parse it into the REST format that @upstash/redis expects.
-function createRedisClient(): Redis {
-  const storageUrl = process.env.STORAGE_REDIS_URL || "";
-
-  // If KV_REST_API_URL is set (Upstash REST), use that directly
-  if (process.env.KV_REST_API_URL) {
-    return new Redis({
-      url: process.env.KV_REST_API_URL,
-      token: process.env.KV_REST_API_TOKEN || "",
-    });
-  }
-
-  // If STORAGE_REDIS_URL looks like a REST URL (https://), use it directly
-  if (storageUrl.startsWith("https://")) {
-    return new Redis({
-      url: storageUrl,
-      token: process.env.STORAGE_REDIS_TOKEN || "",
-    });
-  }
-
-  // If it's a redis:// or rediss:// URL, use Redis.fromEnv() or parse it
-  // Upstash Redis from Vercel marketplace uses REST API format
-  return Redis.fromEnv();
-}
-
-const redis = createRedisClient();
 
 const ARTICLES_KEY = "rcr:articles";
 const SEEN_KEY = "rcr:seen";
@@ -35,20 +7,44 @@ const RUNS_KEY = "rcr:runs";
 const MAX_ARTICLES = 20;
 const EXPIRY_DAYS = 7;
 
-export async function getArticles(): Promise<Article[]> {
-  try {
-    const articles: Article[] = (await redis.get(ARTICLES_KEY)) || [];
-    return articles
-      .filter((a) => {
-        const age = Date.now() - new Date(a.fetchedAt).getTime();
-        return age < EXPIRY_DAYS * 24 * 60 * 60 * 1000;
-      })
-      .sort((a, b) => b.relevanceScore - a.relevanceScore)
-      .slice(0, MAX_ARTICLES);
-  } catch (e) {
-    console.error("[store] Error getting articles:", e);
-    return [];
+let clientPromise: ReturnType<typeof createClient> | null = null;
+
+async function getRedis() {
+  if (!clientPromise) {
+    const url = process.env.STORAGE_REDIS_URL || process.env.REDIS_URL || "";
+    const client = createClient({ url });
+    client.on("error", (err) => console.error("[redis] Error:", err));
+    await client.connect();
+    clientPromise = client as any;
   }
+  return clientPromise!;
+}
+
+async function kvGet<T>(key: string): Promise<T | null> {
+  try {
+    const redis = await getRedis();
+    const val = await redis.get(key);
+    return val ? JSON.parse(val) : null;
+  } catch (e) {
+    console.error(`[store] Error getting ${key}:`, e);
+    return null;
+  }
+}
+
+async function kvSet(key: string, value: any): Promise<void> {
+  const redis = await getRedis();
+  await redis.set(key, JSON.stringify(value));
+}
+
+export async function getArticles(): Promise<Article[]> {
+  const articles: Article[] = (await kvGet(ARTICLES_KEY)) || [];
+  return articles
+    .filter((a) => {
+      const age = Date.now() - new Date(a.fetchedAt).getTime();
+      return age < EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+    })
+    .sort((a, b) => b.relevanceScore - a.relevanceScore)
+    .slice(0, MAX_ARTICLES);
 }
 
 export async function getArticle(id: string): Promise<Article | null> {
@@ -63,51 +59,44 @@ export async function saveArticles(newArticles: Article[]): Promise<void> {
   const merged = [...existing, ...toAdd]
     .sort((a, b) => b.relevanceScore - a.relevanceScore)
     .slice(0, MAX_ARTICLES);
-  await redis.set(ARTICLES_KEY, JSON.stringify(merged));
+  await kvSet(ARTICLES_KEY, merged);
 }
 
 export async function updateArticle(
   id: string,
   updates: Partial<Article>
 ): Promise<Article | null> {
-  const articles: Article[] = (await redis.get(ARTICLES_KEY)) || [];
+  const articles: Article[] = (await kvGet(ARTICLES_KEY)) || [];
   const idx = articles.findIndex((a) => a.id === id);
   if (idx === -1) return null;
   articles[idx] = { ...articles[idx], ...updates };
-  await redis.set(ARTICLES_KEY, JSON.stringify(articles));
+  await kvSet(ARTICLES_KEY, articles);
   return articles[idx];
 }
 
 export async function dismissArticle(id: string): Promise<void> {
-  const articles: Article[] = (await redis.get(ARTICLES_KEY)) || [];
-  await redis.set(
-    ARTICLES_KEY,
-    JSON.stringify(articles.filter((a) => a.id !== id))
-  );
+  const articles: Article[] = (await kvGet(ARTICLES_KEY)) || [];
+  await kvSet(ARTICLES_KEY, articles.filter((a) => a.id !== id));
 }
 
 export async function getSeenUrls(): Promise<Set<string>> {
-  try {
-    const seen: string[] = (await redis.get(SEEN_KEY)) || [];
-    return new Set(seen);
-  } catch {
-    return new Set();
-  }
+  const seen: string[] = (await kvGet(SEEN_KEY)) || [];
+  return new Set(seen);
 }
 
 export async function addSeenUrls(urls: string[]): Promise<void> {
-  const seen: string[] = (await redis.get(SEEN_KEY)) || [];
+  const seen: string[] = (await kvGet(SEEN_KEY)) || [];
   const merged = [...new Set([...seen, ...urls])].slice(-500);
-  await redis.set(SEEN_KEY, JSON.stringify(merged));
+  await kvSet(SEEN_KEY, merged);
 }
 
 export async function logRun(run: PipelineRun): Promise<void> {
-  const runs: PipelineRun[] = (await redis.get(RUNS_KEY)) || [];
+  const runs: PipelineRun[] = (await kvGet(RUNS_KEY)) || [];
   runs.push(run);
-  await redis.set(RUNS_KEY, JSON.stringify(runs.slice(-20)));
+  await kvSet(RUNS_KEY, runs.slice(-20));
 }
 
 export async function getLastRun(): Promise<PipelineRun | null> {
-  const runs: PipelineRun[] = (await redis.get(RUNS_KEY)) || [];
+  const runs: PipelineRun[] = (await kvGet(RUNS_KEY)) || [];
   return runs.length > 0 ? runs[runs.length - 1] : null;
 }
