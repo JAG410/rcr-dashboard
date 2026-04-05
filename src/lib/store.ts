@@ -1,10 +1,33 @@
 import { Redis } from "@upstash/redis";
 import { Article, PipelineRun } from "./types";
 
-const redis = new Redis({
-  url: process.env.STORAGE_REDIS_URL || process.env.KV_REST_API_URL || "",
-  token: process.env.STORAGE_REDIS_TOKEN || process.env.KV_REST_API_TOKEN || "",
-});
+// Vercel's Redis marketplace sets STORAGE_REDIS_URL as a full redis:// URL.
+// Parse it into the REST format that @upstash/redis expects.
+function createRedisClient(): Redis {
+  const storageUrl = process.env.STORAGE_REDIS_URL || "";
+
+  // If KV_REST_API_URL is set (Upstash REST), use that directly
+  if (process.env.KV_REST_API_URL) {
+    return new Redis({
+      url: process.env.KV_REST_API_URL,
+      token: process.env.KV_REST_API_TOKEN || "",
+    });
+  }
+
+  // If STORAGE_REDIS_URL looks like a REST URL (https://), use it directly
+  if (storageUrl.startsWith("https://")) {
+    return new Redis({
+      url: storageUrl,
+      token: process.env.STORAGE_REDIS_TOKEN || "",
+    });
+  }
+
+  // If it's a redis:// or rediss:// URL, use Redis.fromEnv() or parse it
+  // Upstash Redis from Vercel marketplace uses REST API format
+  return Redis.fromEnv();
+}
+
+const redis = createRedisClient();
 
 const ARTICLES_KEY = "rcr:articles";
 const SEEN_KEY = "rcr:seen";
@@ -13,14 +36,19 @@ const MAX_ARTICLES = 20;
 const EXPIRY_DAYS = 7;
 
 export async function getArticles(): Promise<Article[]> {
-  const articles: Article[] = (await redis.get(ARTICLES_KEY)) || [];
-  return articles
-    .filter((a) => {
-      const age = Date.now() - new Date(a.fetchedAt).getTime();
-      return age < EXPIRY_DAYS * 24 * 60 * 60 * 1000;
-    })
-    .sort((a, b) => b.relevanceScore - a.relevanceScore)
-    .slice(0, MAX_ARTICLES);
+  try {
+    const articles: Article[] = (await redis.get(ARTICLES_KEY)) || [];
+    return articles
+      .filter((a) => {
+        const age = Date.now() - new Date(a.fetchedAt).getTime();
+        return age < EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+      })
+      .sort((a, b) => b.relevanceScore - a.relevanceScore)
+      .slice(0, MAX_ARTICLES);
+  } catch (e) {
+    console.error("[store] Error getting articles:", e);
+    return [];
+  }
 }
 
 export async function getArticle(id: string): Promise<Article | null> {
@@ -59,8 +87,12 @@ export async function dismissArticle(id: string): Promise<void> {
 }
 
 export async function getSeenUrls(): Promise<Set<string>> {
-  const seen: string[] = (await redis.get(SEEN_KEY)) || [];
-  return new Set(seen);
+  try {
+    const seen: string[] = (await redis.get(SEEN_KEY)) || [];
+    return new Set(seen);
+  } catch {
+    return new Set();
+  }
 }
 
 export async function addSeenUrls(urls: string[]): Promise<void> {
